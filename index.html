@@ -76,9 +76,28 @@ body.text-large{--scale:1.12}body.text-large h1{font-size:24px}body.text-large .
     <button class="btn primary" id="copyOpenBtn" type="button" disabled>Copiar ISBN y abrir SBS</button>
     <button class="btn ghost" id="manualBtn" type="button">Abrir SBS manualmente</button>
     <button class="btn ghost wide again" id="againBtn" type="button">Escanear otro libro</button>
+    <button class="btn ghost wide" id="batchBtn" type="button">Modo lote</button>
+    <button class="btn ghost wide" id="historyBtn" type="button">Historial</button>
     <button class="btn ghost wide install" id="installBtn" type="button">Instalar como app</button>
   </footer>
 </main>
+
+
+<section id="history" class="screen" style="flex-direction:column;padding:18px;gap:12px;overflow:auto">
+  <div class="settings-top">
+    <button class="back" id="historyBackBtn" type="button" aria-label="Volver">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>
+    </button>
+    <div class="settings-title">Historial</div>
+  </div>
+  <div class="settings-card">
+    <div class="setting-row">
+      <div><div class="setting-label">ISBN escaneados</div><div class="setting-desc">Se guardan solo en este dispositivo.</div></div>
+      <button class="btn ghost" id="clearHistoryBtn" type="button" style="min-height:42px">Borrar</button>
+    </div>
+  </div>
+  <div id="historyList" class="settings-card"></div>
+</section>
 
 <section id="settings" class="screen">
   <div class="settings-top">
@@ -99,6 +118,18 @@ body.text-large{--scale:1.12}body.text-large h1{font-size:24px}body.text-large .
     <div class="setting-row">
       <div><div class="setting-label">Cámara</div><div class="setting-desc">Al abrir la app se intenta iniciar la cámara trasera automáticamente.</div></div>
       <div style="font-size:12px;color:var(--ok);font-weight:800">ACTIVA</div>
+    </div>
+    <div class="setting-row">
+      <div><div class="setting-label">Modo lote</div><div class="setting-desc">Después de cada ISBN detectado, prepara automáticamente el siguiente escaneo.</div></div>
+      <button class="btn ghost" id="batchSettingBtn" type="button" style="min-height:42px">OFF</button>
+    </div>
+    <div class="setting-row">
+      <div><div class="setting-label">Sonido</div><div class="setting-desc">Emite un aviso al detectar un ISBN.</div></div>
+      <button class="btn ghost" id="soundSettingBtn" type="button" style="min-height:42px">OFF</button>
+    </div>
+    <div class="setting-row">
+      <div><div class="setting-label">Vibración</div><div class="setting-desc">Vibra brevemente al detectar un ISBN si el teléfono lo permite.</div></div>
+      <button class="btn ghost" id="vibrateSettingBtn" type="button" style="min-height:42px">OFF</button>
     </div>
   </div>
   <div class="settings-card">
@@ -286,5 +317,211 @@ if('serviceWorker' in navigator)window.addEventListener('load',()=>navigator.ser
 startScanner();
 })();
 </script>
+
+<script>
+/* V6 extras: layered on top of the stable camera implementation. */
+(()=>{
+  const $=id=>document.getElementById(id);
+  const home=$('home'), settings=$('settings'), historyScreen=$('history');
+  const batchBtn=$('batchBtn'), historyBtn=$('historyBtn');
+  const historyBackBtn=$('historyBackBtn'), historyList=$('historyList');
+  const clearHistoryBtn=$('clearHistoryBtn');
+  const batchSettingBtn=$('batchSettingBtn'), soundSettingBtn=$('soundSettingBtn'), vibrateSettingBtn=$('vibrateSettingBtn');
+  const STORAGE='isbn-sbs-v6-history';
+  const PREFS='isbn-sbs-v6-prefs';
+
+  let prefs=Object.assign({batch:false,sound:false,vibrate:false},
+    JSON.parse(localStorage.getItem(PREFS)||'{}'));
+  let batchRestartTimer=null;
+  let audioCtx=null;
+
+  function savePrefs(){
+    localStorage.setItem(PREFS,JSON.stringify(prefs));
+    updatePreferenceUI();
+  }
+
+  function updatePreferenceUI(){
+    const on=v=>v?'ON':'OFF';
+    if(batchSettingBtn) batchSettingBtn.textContent=on(prefs.batch);
+    if(soundSettingBtn) soundSettingBtn.textContent=on(prefs.sound);
+    if(vibrateSettingBtn) vibrateSettingBtn.textContent=on(prefs.vibrate);
+    if(batchBtn) batchBtn.textContent=prefs.batch?'Salir del modo lote':'Modo lote';
+  }
+
+  function getHistory(){
+    try{return JSON.parse(localStorage.getItem(STORAGE)||'[]')}catch{return[]}
+  }
+
+  function setHistory(list){
+    localStorage.setItem(STORAGE,JSON.stringify(list.slice(0,100)));
+  }
+
+  function addHistory(isbn){
+    const list=getHistory();
+    const now=new Date().toISOString();
+    const duplicate=list.some(x=>x.isbn===isbn);
+    const filtered=list.filter(x=>x.isbn!==isbn);
+    filtered.unshift({isbn,time:now,count:duplicate?((list.find(x=>x.isbn===isbn)?.count||1)+1):1});
+    setHistory(filtered);
+    renderHistory();
+    return duplicate;
+  }
+
+  function renderHistory(){
+    if(!historyList)return;
+    const list=getHistory();
+    if(!list.length){
+      historyList.innerHTML='<div class="setting-desc" style="font-size:14px">Todavía no hay ISBN escaneados.</div>';
+      return;
+    }
+    historyList.innerHTML=list.map((x,i)=>{
+      const d=new Date(x.time);
+      const when=isNaN(d)?'':d.toLocaleString('es-AR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+      return `<div class="setting-row" style="padding:10px 0">
+        <div>
+          <div class="setting-label" style="font-variant-numeric:tabular-nums">${x.isbn}</div>
+          <div class="setting-desc">${when}${x.count>1?' · '+x.count+' detecciones':''}</div>
+        </div>
+        <button class="btn ghost history-copy" data-isbn="${x.isbn}" type="button" style="min-height:40px">Copiar</button>
+      </div>`;
+    }).join('');
+    historyList.querySelectorAll('.history-copy').forEach(btn=>{
+      btn.addEventListener('click',async()=>{
+        try{
+          await navigator.clipboard.writeText(btn.dataset.isbn);
+          toastMsg('ISBN copiado');
+        }catch{
+          toastMsg('No se pudo copiar');
+        }
+      });
+    });
+  }
+
+  function unlockAudio(){
+    if(!audioCtx){
+      try{audioCtx=new (window.AudioContext||window.webkitAudioContext)()}catch{return}
+    }
+    if(audioCtx.state==='suspended') audioCtx.resume().catch(()=>{});
+  }
+
+  function beep(){
+    if(!prefs.sound || !audioCtx) return;
+    try{
+      const osc=audioCtx.createOscillator();
+      const gain=audioCtx.createGain();
+      osc.frequency.value=880;
+      gain.gain.value=.035;
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime+.09);
+    }catch{}
+  }
+
+  document.addEventListener('pointerdown',unlockAudio,{passive:true});
+
+  function vibrate(){
+    if(prefs.vibrate && navigator.vibrate){
+      try{navigator.vibrate(70)}catch{}
+    }
+  }
+
+  function toggleSetting(key){
+    prefs[key]=!prefs[key];
+    savePrefs();
+    toastMsg((prefs[key]?'Activado: ':'Desactivado: ')+
+      ({batch:'modo lote',sound:'sonido',vibrate:'vibración'}[key]));
+    if(key==='sound' && prefs[key]) unlockAudio();
+  }
+
+  batchSettingBtn?.addEventListener('click',()=>toggleSetting('batch'));
+  soundSettingBtn?.addEventListener('click',()=>toggleSetting('sound'));
+  vibrateSettingBtn?.addEventListener('click',()=>toggleSetting('vibrate'));
+  batchBtn?.addEventListener('click',()=>{
+    prefs.batch=!prefs.batch;
+    savePrefs();
+    toastMsg(prefs.batch?'Modo lote activado':'Modo lote desactivado');
+    if(prefs.batch && currentIsbn){
+      clearBatchResult();
+      safeBatchRestart();
+    }
+  });
+
+  historyBtn?.addEventListener('click',async()=>{
+    await stopScanner();
+    home.classList.remove('active');
+    settings.classList.remove('active');
+    historyScreen.classList.add('active');
+    renderHistory();
+  });
+
+  historyBackBtn?.addEventListener('click',async()=>{
+    historyScreen.classList.remove('active');
+    home.classList.add('active');
+    await wait(400);
+    startScanner();
+  });
+
+  clearHistoryBtn?.addEventListener('click',()=>{
+    if(!getHistory().length){toastMsg('El historial ya está vacío');return}
+    localStorage.removeItem(STORAGE);
+    renderHistory();
+    toastMsg('Historial borrado');
+  });
+
+  function clearBatchResult(){
+    currentIsbn='';
+    $('reader').innerHTML='';
+    $('isbn').textContent='';
+    $('result').style.display='none';
+    $('copyOpenBtn').disabled=true;
+    $('againBtn').style.display='none';
+    setStatus('Preparando siguiente libro…');
+  }
+
+  async function safeBatchRestart(){
+    if(batchRestartTimer) clearTimeout(batchRestartTimer);
+    batchRestartTimer=setTimeout(async()=>{
+      if(!prefs.batch || leavingForSbs || settings.classList.contains('active') || historyScreen.classList.contains('active')) return;
+      await stopScanner();
+      await wait(500);
+      startScanner();
+    },700);
+  }
+
+  /*
+   * Intercepta el resultado sin reemplazar la función de cámara:
+   * el scanner original sigue congelando y liberando el frame.
+   * MutationObserver detecta el ISBN mostrado y registra el evento una sola vez.
+   */
+  let lastRecorded='';
+  const resultObserver=new MutationObserver(()=>{
+    const isbn=($('isbn')?.textContent||'').trim();
+    if(!isbn || isbn===lastRecorded) return;
+    lastRecorded=isbn;
+    const duplicate=addHistory(isbn);
+    beep();
+    vibrate();
+    if(duplicate) toastMsg('ISBN ya estaba en el historial');
+    if(prefs.batch){
+      setTimeout(()=>{
+        if(!leavingForSbs && !settings.classList.contains('active') && !historyScreen.classList.contains('active')){
+          clearBatchResult();
+          safeBatchRestart();
+        }
+      },900);
+    }
+  });
+  resultObserver.observe($('isbn'),{childList:true,characterData:true,subtree:true});
+
+  window.addEventListener('beforeunload',()=>{
+    if(batchRestartTimer) clearTimeout(batchRestartTimer);
+  });
+
+  updatePreferenceUI();
+  renderHistory();
+})();
+</script>
+
 </body>
 </html>
